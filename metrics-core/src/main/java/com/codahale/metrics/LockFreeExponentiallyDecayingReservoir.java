@@ -61,6 +61,8 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
         private final ConcurrentSkipListMap<Double, WeightedSample> values;
 
         private volatile int count;
+        // Racily updated minimum observed priority used to avoid unnecessary 'values' map traversal.
+        private volatile double priorityFloor;
 
         State(
                 double alphaNanos,
@@ -73,22 +75,31 @@ public final class LockFreeExponentiallyDecayingReservoir implements Reservoir {
             this.startTick = startTick;
             this.values = values;
             this.count = count;
+            this.priorityFloor = count >= size ? values.firstKey() : Double.NEGATIVE_INFINITY;
         }
 
         private void update(long value, long timestampNanos) {
             double itemWeight = weight(timestampNanos - startTick);
             double priority = itemWeight / ThreadLocalRandom.current().nextDouble();
-            boolean mapIsFull = count >= size;
-            if (!mapIsFull || values.firstKey() < priority) {
-                addSample(priority, value, itemWeight, mapIsFull);
+            if (priorityFloor < priority) {
+                boolean mapIsFull = count >= size;
+                if (!mapIsFull || values.firstKey() < priority) {
+                    addSample(priority, value, itemWeight, mapIsFull);
+                }
             }
         }
 
         private void addSample(double priority, long value, double itemWeight, boolean bypassIncrement) {
             if (values.putIfAbsent(priority, new WeightedSample(value, itemWeight)) == null
                     && (bypassIncrement || countUpdater.incrementAndGet(this) > size)) {
-                values.pollFirstEntry();
+                removeMinimumEntry();
             }
+        }
+
+        private void removeMinimumEntry() {
+            // These updates may move backward, however it's the first fast-path check
+            // and likely not worth the cost of cas operations.
+            priorityFloor = values.pollFirstEntry().getKey();
         }
 
         /* "A common feature of the above techniques—indeed, the key technique that
